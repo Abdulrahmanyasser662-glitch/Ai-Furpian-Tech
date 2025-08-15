@@ -1,2 +1,374 @@
 # Ai-Furpian-Tech
 Virtual Air-Draw (front camera, pinch-to-draw)
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover"
+  />
+  <title>Air Draw — Front Camera Hand Gesture</title>
+  <style>
+    :root{
+      --ui-bg:#0f0f12; --ui-card:#17171c; --ui-text:#f4f4f5;
+      --ui-sub:#b5b5bd; --ui-accent:#6ea8fe; --ui-border:#2a2a31;
+    }
+    *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+    html,body{height:100%;margin:0;background:var(--ui-bg);color:var(--ui-text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial}
+    .app{
+      position:relative; height:100%; width:100%;
+      display:flex; flex-direction:column; gap:10px; padding:10px;
+    }
+    .stage{
+      position:relative; flex:1; border:1px solid var(--ui-border);
+      border-radius:12px; overflow:hidden; background:#000;
+    }
+    video, canvas{ position:absolute; inset:0; width:100%; height:100%; }
+    video{ transform:scaleX(-1); object-fit:cover; }
+    .overlay{ pointer-events:none; }
+    .panel{
+      display:flex; gap:10px; flex-wrap:wrap; align-items:center;
+      background:var(--ui-card); border:1px solid var(--ui-border);
+      padding:10px; border-radius:12px;
+    }
+    .btn{
+      appearance:none; border:1px solid var(--ui-border); background:#1e1e24;
+      color:var(--ui-text); padding:10px 12px; border-radius:10px; cursor:pointer;
+      font-weight:600;
+    }
+    .btn:active{ transform:translateY(1px) }
+    .btn.secondary{ background:#15151a }
+    .swatch{
+      width:28px; height:28px; border-radius:50%; border:2px solid #fff2;
+      cursor:pointer; display:inline-block;
+    }
+    .swatch.selected{ outline:2px solid var(--ui-accent); outline-offset:2px }
+    .row{ display:flex; align-items:center; gap:10px; }
+    .grow{ flex:1 }
+    input[type="range"]{ width:160px }
+    .hint{
+      color:var(--ui-sub); font-size:13px; line-height:1.3;
+    }
+    .badge{ padding:4px 8px; border:1px solid var(--ui-border); border-radius:999px; font-size:12px; color:var(--ui-sub) }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="stage" id="stage">
+      <video id="video" playsinline autoplay muted></video>
+      <canvas id="draw"></canvas>
+      <canvas id="overlay" class="overlay"></canvas>
+    </div>
+
+    <div class="panel">
+      <span class="badge">Pinch index + thumb to draw</span>
+      <div class="row">
+        <span class="hint">Brush</span>
+        <input id="size" type="range" min="2" max="30" step="1" value="8" />
+      </div>
+
+      <div class="row">
+        <span class="hint">Color</span>
+        <div id="palette" class="row">
+          <!-- colors will be injected -->
+        </div>
+      </div>
+
+      <div class="row">
+        <button id="undo" class="btn secondary">Undo</button>
+        <button id="redo" class="btn secondary">Redo</button>
+        <button id="clear" class="btn secondary">Clear</button>
+      </div>
+
+      <div class="row grow" style="justify-content:flex-end">
+        <label class="hint" style="display:flex;align-items:center;gap:8px;">
+          <input id="showLandmarks" type="checkbox" checked /> Show landmarks
+        </label>
+        <button id="save" class="btn">Save PNG</button>
+      </div>
+    </div>
+
+    <div class="hint">
+      Tips: Good lighting helps tracking. Keep your hand ~40–80 cm from the camera. If the camera doesn't start on iOS, ensure you're on HTTPS and have granted permission in Settings ▸ Safari ▸ Camera.
+    </div>
+  </div>
+
+  <!-- MediaPipe Hands (classic API) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+
+  <script>
+    // ---------- DOM ----------
+    const video = document.getElementById('video');
+    const drawCanvas = document.getElementById('draw');
+    const overlayCanvas = document.getElementById('overlay');
+    const stage = document.getElementById('stage');
+
+    const ctxDraw = drawCanvas.getContext('2d');
+    const ctxOverlay = overlayCanvas.getContext('2d');
+
+    const sizeInput = document.getElementById('size');
+    const undoBtn = document.getElementById('undo');
+    const redoBtn = document.getElementById('redo');
+    const clearBtn = document.getElementById('clear');
+    const saveBtn = document.getElementById('save');
+    const showLmToggle = document.getElementById('showLandmarks');
+    const palette = document.getElementById('palette');
+
+    const COLORS = ['#ffffff','#ff4757','#ffa502','#ffdd59','#2ed573','#1e90ff','#a29bfe','#ff6b81','#00d1b2','#f368e0','#222222'];
+    let brushColor = COLORS[5];
+    let brushSize = parseInt(sizeInput.value, 10);
+
+    // Inject color swatches
+    function buildPalette(){
+      palette.innerHTML = '';
+      COLORS.forEach(c=>{
+        const el = document.createElement('button');
+        el.className = 'swatch' + (c===brushColor?' selected':'');
+        el.style.background = c;
+        el.title = c;
+        el.addEventListener('click', ()=>{
+          brushColor = c;
+          [...palette.children].forEach(ch=>ch.classList.remove('selected'));
+          el.classList.add('selected');
+        });
+        palette.appendChild(el);
+      });
+    }
+    buildPalette();
+
+    // Resize canvases to stage size (and handle DPR)
+    function fitCanvases(){
+      const rect = stage.getBoundingClientRect();
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+
+      [drawCanvas, overlayCanvas].forEach(cv=>{
+        cv.width = Math.floor(rect.width * dpr);
+        cv.height = Math.floor(rect.height * dpr);
+        cv.style.width = rect.width + 'px';
+        cv.style.height = rect.height + 'px';
+        const c = cv.getContext('2d');
+        c.setTransform(dpr, 0, 0, dpr, 0, 0);
+      });
+    }
+    window.addEventListener('resize', fitCanvases);
+    fitCanvases();
+
+    // ---------- Stroke model for undo/redo ----------
+    let strokes = [];     // [{color, size, points:[{x,y}]}]
+    let redoStack = [];
+    let currentStroke = null;
+
+    function startStroke(x,y){
+      currentStroke = { color: brushColor, size: brushSize, points: [{x,y}] };
+    }
+    function addPoint(x,y){
+      if(!currentStroke) return;
+      const pts = currentStroke.points;
+      const last = pts[pts.length-1];
+      const dx = x - last.x, dy = y - last.y;
+      const dist2 = dx*dx + dy*dy;
+      if(dist2 > 1) pts.push({x,y});
+      redraw();
+    }
+    function endStroke(){
+      if(currentStroke && currentStroke.points.length>1){
+        strokes.push(currentStroke);
+        redoStack = [];
+      }
+      currentStroke = null;
+      redraw();
+    }
+
+    function redraw(){
+      ctxDraw.clearRect(0,0,drawCanvas.width,drawCanvas.height);
+      const render = s=>{
+        ctxDraw.lineJoin = 'round';
+        ctxDraw.lineCap = 'round';
+        ctxDraw.strokeStyle = s.color;
+        ctxDraw.lineWidth = s.size;
+        ctxDraw.beginPath();
+        const pts = s.points;
+        for(let i=1;i<pts.length;i++){
+          ctxDraw.moveTo(pts[i-1].x, pts[i-1].y);
+          ctxDraw.lineTo(pts[i].x, pts[i].y);
+        }
+        ctxDraw.stroke();
+      };
+      strokes.forEach(render);
+      if(currentStroke) render(currentStroke);
+    }
+
+    undoBtn.onclick = ()=>{
+      if(strokes.length){
+        redoStack.push(strokes.pop());
+        redraw();
+      }
+    };
+    redoBtn.onclick = ()=>{
+      if(redoStack.length){
+        strokes.push(redoStack.pop());
+        redraw();
+      }
+    };
+    clearBtn.onclick = ()=>{
+      strokes = []; redoStack = []; currentStroke=null; redraw();
+    };
+    sizeInput.oninput = ()=> brushSize = parseInt(sizeInput.value, 10);
+    showLmToggle.onchange = ()=>{}; // handled in render loop
+    saveBtn.onclick = ()=>{
+      // Merge draw layer onto a clean image at canvas size
+      const exportCanvas = document.createElement('canvas');
+      exportCanvas.width = drawCanvas.width;
+      exportCanvas.height = drawCanvas.height;
+      const ectx = exportCanvas.getContext('2d');
+      ectx.setTransform(1,0,0,1,0,0);
+      // optional: black transparent background is fine; just draw strokes
+      ectx.drawImage(drawCanvas, 0, 0);
+      const url = exportCanvas.toDataURL('image/png');
+      const a = document.createElement('a');
+      a.href = url; a.download = 'air-draw.png'; a.click();
+    };
+
+    // ---------- Hand detection (MediaPipe Hands classic) ----------
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions({
+      maxNumHands: 1,
+      selfieMode: true,                 // mirror to match front camera
+      modelComplexity: 1,
+      minDetectionConfidence: 0.7,
+      minTrackingConfidence: 0.6
+    });
+
+    hands.onResults(onResults);
+
+    // Set up camera stream with front camera
+    // Use MediaPipe Camera util for backpressure-safe frames
+    const camera = new Camera(video, {
+      onFrame: async () => { await hands.send({image: video}); },
+      width: 1280,
+      height: 720,
+      facingMode: 'user'
+    });
+
+    // Try to start camera; if it fails (iOS permissions), fallback to getUserMedia
+    (async ()=>{
+      try { await camera.start(); }
+      catch(e){
+        // Fallback: plain getUserMedia
+        try{
+          const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'}});
+          video.srcObject = stream;
+          await video.play();
+          // Manual RAF loop
+          async function loop(){
+            await hands.send({image: video});
+            requestAnimationFrame(loop);
+          }
+          loop();
+        }catch(err){
+          alert('Camera access failed. Ensure HTTPS and allow camera permission in your browser settings.');
+          console.error(err);
+        }
+      }
+    })();
+
+    // ---------- Gesture logic ----------
+    // Use index fingertip (8) as brush. Draw while "pinching" (distance 4-8 under threshold).
+    // Also smooth the point to reduce jitter.
+    let isDrawing = false;
+    let smoothX = null, smoothY = null;
+
+    function onResults(results){
+      fitCanvases(); // ensure consistent mapping when orientation changes
+      ctxOverlay.clearRect(0,0,overlayCanvas.width,overlayCanvas.height);
+
+      if(results.multiHandLandmarks && results.multiHandLandmarks.length){
+        const lm = results.multiHandLandmarks[0];
+
+        const w = overlayCanvas.clientWidth;
+        const h = overlayCanvas.clientHeight;
+
+        // Landmarks are already mirrored (selfieMode: true)
+        const pt = (i)=>{
+          return { x: lm[i].x * w, y: lm[i].y * h, z: lm[i].z };
+        };
+
+        const indexTip = pt(8);
+        const thumbTip = pt(4);
+
+        // Exponential smoothing
+        const alpha = 0.35;
+        if(smoothX==null){ smoothX=indexTip.x; smoothY=indexTip.y; }
+        else{
+          smoothX = alpha*indexTip.x + (1-alpha)*smoothX;
+          smoothY = alpha*indexTip.y + (1-alpha)*smoothY;
+        }
+
+        // Pinch detection threshold relative to screen size
+        const dx = (indexTip.x - thumbTip.x);
+        const dy = (indexTip.y - thumbTip.y);
+        const pinchDist = Math.hypot(dx, dy);
+
+        // Reasonable threshold: ~2.5% of diagonal
+        const diag = Math.hypot(w,h);
+        const pinchThreshold = 0.025 * diag;
+
+        const nowDrawing = pinchDist < pinchThreshold;
+
+        // Draw landmarks/connections (optional)
+        if(showLmToggle.checked){
+          drawConnectors(ctxOverlay, lm, HAND_CONNECTIONS,
+            {color:'#66ccff88', lineWidth: 2});
+          drawLandmarks(ctxOverlay, lm, {color:'#ffffffcc', lineWidth: 1, radius: 2});
+          // Visualize pinch threshold
+          ctxOverlay.beginPath();
+          ctxOverlay.arc(thumbTip.x, thumbTip.y, pinchThreshold, 0, Math.PI*2);
+          ctxOverlay.strokeStyle = '#ffffff22';
+          ctxOverlay.lineWidth = 1;
+          ctxOverlay.stroke();
+
+          // Cursor dot at index tip
+          ctxOverlay.beginPath();
+          ctxOverlay.arc(smoothX, smoothY, Math.max(3, brushSize/2), 0, Math.PI*2);
+          ctxOverlay.fillStyle = nowDrawing ? '#00ffaaaa' : '#ffffff55';
+          ctxOverlay.fill();
+        }
+
+        // State transitions
+        if(nowDrawing && !isDrawing){
+          // start stroke
+          const p = canvasToDrawCoords(smoothX, smoothY);
+          startStroke(p.x, p.y);
+          isDrawing = true;
+        }else if(nowDrawing && isDrawing){
+          const p = canvasToDrawCoords(smoothX, smoothY);
+          addPoint(p.x, p.y);
+        }else if(!nowDrawing && isDrawing){
+          endStroke();
+          isDrawing = false;
+        }
+
+      }else{
+        // No hand—end any stroke gracefully
+        if(isDrawing){ endStroke(); isDrawing=false; }
+      }
+    }
+
+    // Map overlay pixel coords to drawing canvas coords (same CSS size & DPR transform)
+    function canvasToDrawCoords(x, y){
+      const rect = drawCanvas.getBoundingClientRect();
+      const scaleX = drawCanvas.width / rect.width;
+      const scaleY = drawCanvas.height / rect.height;
+      return { x: x * scaleX, y: y * scaleY };
+    }
+
+    // Prevent iOS from sleeping video
+    document.addEventListener('gesturestart', e=>e.preventDefault());
+  </script>
+</body>
+</html>
